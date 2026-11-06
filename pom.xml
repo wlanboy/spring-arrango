@@ -28,6 +28,7 @@
 	</scm>
 	<properties>
 		<java.version>25</java.version>
+		<arangodb-spring-data.version>5.1.0</arangodb-spring-data.version>
 	</properties>
 	<dependencies>
 		<dependency>
@@ -37,6 +38,11 @@
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webmvc</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>com.arangodb</groupId>
+			<artifactId>arangodb-spring-data</artifactId>
+			<version>${arangodb-spring-data.version}</version>
 		</dependency>
 
 		<dependency>
