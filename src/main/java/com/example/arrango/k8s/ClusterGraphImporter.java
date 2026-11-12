@@ -648,10 +648,11 @@ public class ClusterGraphImporter {
 		return mounts;
 	}
 
-	private static References envRef(String podId, String collection, String ns, String name, String envVar, String key) {
+	private static References envRef(String podId, String collection, String ns, String name, String envVar,
+			String dataKey) {
 		var ref = new References(podId, collection + "/" + K8sResource.keyOf(ns, name));
 		ref.setEnvVar(envVar);
-		ref.setKey(key);
+		ref.setDataKey(dataKey);
 		return ref;
 	}
 

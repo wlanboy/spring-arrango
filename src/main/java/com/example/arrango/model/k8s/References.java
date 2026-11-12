@@ -8,7 +8,8 @@ public class References extends K8sEdge {
 
 	private String envVar;
 
-	private String key;
+	/** Key in der ConfigMap bzw. dem Secret ({@code valueFrom.*KeyRef.key}); {@code null} bei {@code envFrom}. */
+	private String dataKey;
 
 	private boolean envFrom;
 
@@ -21,7 +22,7 @@ public class References extends K8sEdge {
 
 	@Override
 	public String identity() {
-		return envFrom ? "envFrom" : envVar + "|" + key;
+		return envFrom ? "envFrom" : envVar + "|" + dataKey;
 	}
 
 	public String getEnvVar() {
@@ -32,12 +33,12 @@ public class References extends K8sEdge {
 		this.envVar = envVar;
 	}
 
-	public String getKey() {
-		return key;
+	public String getDataKey() {
+		return dataKey;
 	}
 
-	public void setKey(String key) {
-		this.key = key;
+	public void setDataKey(String dataKey) {
+		this.dataKey = dataKey;
 	}
 
 	public boolean isEnvFrom() {
