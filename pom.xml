@@ -49,6 +49,18 @@
 			<groupId>io.fabric8</groupId>
 			<artifactId>kubernetes-client</artifactId>
 			<version>${fabric8-kubernetes-client.version}</version>
+			<exclusions>
+				<!-- Vert.x 5 kollidiert mit dem Vert.x des ArangoDB-Treibers -->
+				<exclusion>
+					<groupId>io.fabric8</groupId>
+					<artifactId>kubernetes-httpclient-vertx-5</artifactId>
+				</exclusion>
+			</exclusions>
+		</dependency>
+		<dependency>
+			<groupId>io.fabric8</groupId>
+			<artifactId>kubernetes-httpclient-jdk</artifactId>
+			<version>${fabric8-kubernetes-client.version}</version>
 		</dependency>
 
 		<dependency>
