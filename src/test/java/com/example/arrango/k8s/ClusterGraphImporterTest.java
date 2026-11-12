@@ -35,9 +35,7 @@ import io.fabric8.kubernetes.api.model.apps.ReplicaSetBuilder;
 import io.fabric8.kubernetes.api.model.batch.v1.CronJobBuilder;
 import io.fabric8.kubernetes.api.model.batch.v1.JobBuilder;
 import io.fabric8.kubernetes.api.model.storage.StorageClassBuilder;
-import io.fabric8.kubernetes.client.KubernetesClient;
-import io.fabric8.kubernetes.client.server.mock.EnableKubernetesMockClient;
-import io.fabric8.kubernetes.client.server.mock.KubernetesMockServer;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -64,28 +62,31 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Importer gegen einen fabric8-Mock-API-Server im CRUD-Modus; ArangoDB ist durch {@link ArangoRecorder} ersetzt.
+ * Importer gegen {@link FakeKubernetesApi}; ArangoDB ist durch {@link ArangoRecorder} ersetzt.
  * Geprüft wird, welche Vertices und Kanten der Importer schreibt und mit welchem Scope er aufräumt.
  */
-@EnableKubernetesMockClient(crud = true)
 class ClusterGraphImporterTest {
 
 	private static final String NS = "shop";
 
-	KubernetesMockServer server;
-	KubernetesClient client;
-
+	private FakeKubernetesApi api;
 	private ArangoRecorder arango;
 
 	@BeforeEach
-	void setUp() {
+	void setUp() throws IOException {
+		api = new FakeKubernetesApi();
 		arango = new ArangoRecorder();
 		create(new NamespaceBuilder().withMetadata(meta(null, NS)).build());
 		create(new NamespaceBuilder().withMetadata(meta(null, "other")).build());
 	}
 
+	@AfterEach
+	void tearDown() {
+		api.close();
+	}
+
 	private ClusterGraphImporter importer(String... namespaces) {
-		return new ClusterGraphImporter(client, arango.operations,
+		return new ClusterGraphImporter(api.client, arango.operations,
 				new ArangoProperties("localhost", 8529, "root", "", "test"),
 				new K8sImportProperties(false, List.of(namespaces)));
 	}
@@ -385,8 +386,7 @@ class ClusterGraphImporterTest {
 
 	@Test
 	void unreadableCollectionIsReportedAndNotCleanedUp() {
-		server.expect().get().withPath("/apis/storage.k8s.io/v1/storageclasses")
-				.andReturn(403, "{\"kind\":\"Status\",\"code\":403,\"message\":\"forbidden\"}").always();
+		api.fail("/apis/storage.k8s.io/v1/storageclasses", 403);
 		create(pod("web-1", null, null, Map.of()));
 
 		var result = importer().importCluster();
@@ -406,8 +406,7 @@ class ClusterGraphImporterTest {
 
 	@Test
 	void unreadableNamespaceKeepsItsOldStateOnly() {
-		server.expect().get().withPath("/api/v1/namespaces/other/configmaps")
-				.andReturn(403, "{\"kind\":\"Status\",\"code\":403,\"message\":\"forbidden\"}").always();
+		api.fail("/api/v1/namespaces/other/configmaps", 403);
 		create(new ConfigMapBuilder().withMetadata(meta(NS, "settings")).build());
 
 		var result = importer(NS, "other").importCluster();
@@ -482,7 +481,7 @@ class ClusterGraphImporterTest {
 	// ---------------------------------------------------------------- Fixtures
 
 	private void create(HasMetadata resource) {
-		client.resource(resource).create();
+		api.add(resource);
 	}
 
 	private List<String> keys(String collection) {
