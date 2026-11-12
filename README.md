@@ -22,30 +22,32 @@ The app can read a Kubernetes cluster (current kubeconfig context, or the Servic
 Imports are incremental, both on startup and through `POST /api/k8s/import`:
 
 - Vertices and edges have stable keys and are upserted. Each document carries `firstSeen` (kept across imports) and `lastSeen` (timestamp of the last import that saw it).
-- Only documents the current import no longer sees are removed, and only within its scope: with `K8S_IMPORT_NAMESPACES` set, other namespaces stay untouched. Nodes and PVs are always in scope.
+- Only documents the current import no longer sees are removed, and only within its scope: with `K8S_IMPORT_NAMESPACES` set, other namespaces stay untouched. Cluster-scoped resources (namespaces, nodes, storage classes, PVs) are always in scope.
 - Helm releases keep a `history` of all revisions ever imported (revision, status, chart version, app version, deploy time), including revisions whose secrets Helm has since pruned.
 
 The import returns `inserted`/`updated`/`removed` per collection.
 
-Vertex collections: `helm_releases`, `deployments`, `stateful_sets`, `daemon_sets`, `replica_sets`, `pods`, `services`, `config_maps`, `secrets` (type and key names only, never values), `service_accounts`, `nodes`, `persistent_volume_claims`, `persistent_volumes`.
+Vertex collections: `namespaces`, `helm_releases`, `deployments`, `stateful_sets`, `daemon_sets`, `replica_sets`, `cron_jobs`, `jobs` (status `Complete`/`Failed`/`Suspended`/`Running`), `pods`, `services`, `config_maps`, `secrets` (type and key names only, never values), `service_accounts`, `nodes`, `persistent_volume_claims`, `persistent_volumes`, `storage_classes` (with `defaultClass`).
 
 | Edge collection | From → To | Source in Kubernetes |
 |---|---|---|
+| `contains` | Namespace → every namespaced resource | `metadata.namespace` |
 | `manages` | HelmRelease → resource | annotation `meta.helm.sh/release-name` |
-| `owns` | Deployment → ReplicaSet → Pod, DaemonSet/StatefulSet → Pod | `metadata.ownerReferences` |
+| `owns` | Deployment → ReplicaSet → Pod, DaemonSet/StatefulSet → Pod, CronJob → Job → Pod | `metadata.ownerReferences` |
 | `mounts` | Pod → ConfigMap / Secret / PVC | `spec.volumes` (incl. projected), with volume name and mount paths |
 | `references` | Pod → ConfigMap / Secret | `env.valueFrom`, `envFrom` |
 | `selects` | Service → Pod | label selector |
 | `scheduled_on` | Pod → Node | `spec.nodeName` |
 | `uses_service_account` | Pod → ServiceAccount | `spec.serviceAccountName` |
 | `binds` | PVC → PV | `spec.volumeName` |
+| `uses_storage_class` | PVC / PV → StorageClass | `spec.storageClassName` |
 
 All collections are part of the named graph `k8s`, so the ArangoDB web UI can render it (Graphs → k8s).
 
 | Variable | Default | |
 |---|---|---|
 | `K8S_IMPORT_ON_STARTUP` | `true` | import once when the app is ready |
-| `K8S_IMPORT_NAMESPACES` | _(all)_ | comma-separated list; nodes and PVs are always imported |
+| `K8S_IMPORT_NAMESPACES` | _(all)_ | comma-separated list; namespaces, nodes, storage classes and PVs are always imported |
 
 Endpoints:
 
@@ -67,4 +69,4 @@ Document keys are `<namespace>.<name>` (cluster-scoped: `<name>`), so ids look l
 
 "Unused" only covers mounts and env references. A ConfigMap that a controller reads through the API (for example `istio-system/istio`, read by istiod) still shows up as unused.
 
-Running the import inside the cluster needs a ClusterRole with `get`/`list` on nodes, persistentvolumes, namespaced pods, services, configmaps, secrets, serviceaccounts, persistentvolumeclaims and on `apps` deployments, statefulsets, daemonsets, replicasets. Secrets are needed for Helm releases (`sh.helm.release.v1.*`). The `POST /api/k8s/import` endpoint has no authentication.
+Running the import inside the cluster needs a ClusterRole with `get`/`list` on namespaces, nodes, persistentvolumes, `storage.k8s.io` storageclasses, namespaced pods, services, configmaps, secrets, serviceaccounts, persistentvolumeclaims and on `apps` deployments, statefulsets, daemonsets, replicasets and on `batch` jobs, cronjobs. Secrets are needed for Helm releases (`sh.helm.release.v1.*`). The `POST /api/k8s/import` endpoint has no authentication.
