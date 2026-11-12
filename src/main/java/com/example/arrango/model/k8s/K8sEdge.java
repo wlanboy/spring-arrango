@@ -9,6 +9,9 @@ import org.springframework.data.annotation.Id;
  * weil eine Kante (z. B. {@code manages}) auf beliebige Ressource-Typen zeigen kann.
  * {@code @From}/{@code @To} würden ein Entity-Feld eines festen Typs verlangen, daher das direkte Mapping per
  * {@code @Field}.
+ * <p>
+ * Der Key wird beim Import aus {@code _from}, {@code _to} und {@link #identity()} abgeleitet, damit dieselbe Kante
+ * bei jedem Import dasselbe Dokument trifft.
  */
 public abstract class K8sEdge {
 
@@ -23,6 +26,13 @@ public abstract class K8sEdge {
 
 	@Field("_to")
 	private String to;
+
+	/** Namespace des Start-Vertex; {@code null} bei cluster-weiten Ressourcen. */
+	private String namespace;
+
+	private String firstSeen;
+
+	private String lastSeen;
 
 	protected K8sEdge() {
 	}
@@ -62,5 +72,37 @@ public abstract class K8sEdge {
 
 	public void setTo(String to) {
 		this.to = to;
+	}
+
+	/**
+	 * Unterscheidet mehrere Kanten desselben Typs zwischen denselben Vertices (z. B. zwei Volumes auf dieselbe
+	 * ConfigMap). Standard: keine weitere Unterscheidung.
+	 */
+	public String identity() {
+		return "";
+	}
+
+	public String getNamespace() {
+		return namespace;
+	}
+
+	public void setNamespace(String namespace) {
+		this.namespace = namespace;
+	}
+
+	public String getFirstSeen() {
+		return firstSeen;
+	}
+
+	public void setFirstSeen(String firstSeen) {
+		this.firstSeen = firstSeen;
+	}
+
+	public String getLastSeen() {
+		return lastSeen;
+	}
+
+	public void setLastSeen(String lastSeen) {
+		this.lastSeen = lastSeen;
 	}
 }

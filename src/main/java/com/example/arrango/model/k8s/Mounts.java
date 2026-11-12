@@ -23,6 +23,11 @@ public class Mounts extends K8sEdge {
 		super(from, to);
 	}
 
+	@Override
+	public String identity() {
+		return volumeName + "|" + source;
+	}
+
 	public String getVolumeName() {
 		return volumeName;
 	}

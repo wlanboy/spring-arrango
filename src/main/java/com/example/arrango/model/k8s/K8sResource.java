@@ -8,7 +8,7 @@ import java.util.Map;
 /**
  * Gemeinsame Felder aller Kubernetes-Ressourcen im Graph.
  * Der Key ist {@code <namespace>.<name>} bzw. bei cluster-weiten Ressourcen nur {@code <name>},
- * damit ein erneuter Import dieselben Dokumente überschreibt statt Duplikate anzulegen.
+ * damit ein erneuter Import dieselben Dokumente aktualisiert statt Duplikate anzulegen.
  */
 public abstract class K8sResource {
 
@@ -29,6 +29,12 @@ public abstract class K8sResource {
 	private Map<String, String> labels;
 
 	private String createdAt;
+
+	/** Zeitpunkt des ersten Imports, der die Ressource gesehen hat; bleibt bei Updates erhalten. */
+	private String firstSeen;
+
+	/** Zeitpunkt des letzten Imports, der die Ressource gesehen hat. */
+	private String lastSeen;
 
 	protected K8sResource() {
 	}
@@ -106,5 +112,21 @@ public abstract class K8sResource {
 
 	public void setCreatedAt(String createdAt) {
 		this.createdAt = createdAt;
+	}
+
+	public String getFirstSeen() {
+		return firstSeen;
+	}
+
+	public void setFirstSeen(String firstSeen) {
+		this.firstSeen = firstSeen;
+	}
+
+	public String getLastSeen() {
+		return lastSeen;
+	}
+
+	public void setLastSeen(String lastSeen) {
+		this.lastSeen = lastSeen;
 	}
 }

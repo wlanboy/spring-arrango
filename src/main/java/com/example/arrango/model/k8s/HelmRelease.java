@@ -2,7 +2,13 @@ package com.example.arrango.model.k8s;
 
 import com.arangodb.springframework.annotation.Document;
 
-/** Helm-Release (aus dem Release-Secret {@code sh.helm.release.v1.<name>.v<rev>}). */
+import java.util.List;
+
+/**
+ * Helm-Release (aus dem Release-Secret {@code sh.helm.release.v1.<name>.v<rev>}). Die Felder beschreiben die
+ * neueste Revision; {@link #getHistory()} sammelt alle Revisionen, die ein Import je gesehen hat, auch wenn Helm
+ * die alten Secrets inzwischen gelöscht hat.
+ */
 @Document("helm_releases")
 public class HelmRelease extends K8sResource {
 
@@ -15,6 +21,9 @@ public class HelmRelease extends K8sResource {
 	private int revision;
 
 	private String status;
+
+	/** Alle bekannten Revisionen, neueste zuerst. */
+	private List<HelmRevision> history;
 
 	public HelmRelease() {
 	}
@@ -61,5 +70,13 @@ public class HelmRelease extends K8sResource {
 
 	public void setStatus(String status) {
 		this.status = status;
+	}
+
+	public List<HelmRevision> getHistory() {
+		return history;
+	}
+
+	public void setHistory(List<HelmRevision> history) {
+		this.history = history;
 	}
 }

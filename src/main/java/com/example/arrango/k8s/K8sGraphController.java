@@ -20,7 +20,6 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
-import java.util.Map;
 
 @RestController
 @RequestMapping("/api/k8s")
@@ -44,7 +43,7 @@ public class K8sGraphController {
 	}
 
 	@PostMapping("/import")
-	public Map<String, Integer> importCluster() {
+	public ImportResult importCluster() {
 		return importer.importCluster();
 	}
 

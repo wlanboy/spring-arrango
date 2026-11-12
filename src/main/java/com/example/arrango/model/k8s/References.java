@@ -19,6 +19,11 @@ public class References extends K8sEdge {
 		super(from, to);
 	}
 
+	@Override
+	public String identity() {
+		return envFrom ? "envFrom" : envVar + "|" + key;
+	}
+
 	public String getEnvVar() {
 		return envVar;
 	}

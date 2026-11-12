@@ -17,7 +17,15 @@ Health: `GET /actuator/health`
 
 
 ## Kubernetes graph example
-The app can read a Kubernetes cluster (current kubeconfig context, or the ServiceAccount when running in a pod) and store it as a graph in ArangoDB. Each import replaces the previous snapshot.
+The app can read a Kubernetes cluster (current kubeconfig context, or the ServiceAccount when running in a pod) and store it as a graph in ArangoDB.
+
+Imports are incremental, both on startup and through `POST /api/k8s/import`:
+
+- Vertices and edges have stable keys and are upserted. Each document carries `firstSeen` (kept across imports) and `lastSeen` (timestamp of the last import that saw it).
+- Only documents the current import no longer sees are removed, and only within its scope: with `K8S_IMPORT_NAMESPACES` set, other namespaces stay untouched. Nodes and PVs are always in scope.
+- Helm releases keep a `history` of all revisions ever imported (revision, status, chart version, app version, deploy time), including revisions whose secrets Helm has since pruned.
+
+The import returns `inserted`/`updated`/`removed` per collection.
 
 Vertex collections: `helm_releases`, `deployments`, `stateful_sets`, `daemon_sets`, `replica_sets`, `pods`, `services`, `config_maps`, `secrets` (type and key names only, never values), `service_accounts`, `nodes`, `persistent_volume_claims`, `persistent_volumes`.
 
@@ -36,14 +44,14 @@ All collections are part of the named graph `k8s`, so the ArangoDB web UI can re
 
 | Variable | Default | |
 |---|---|---|
-| `K8S_IMPORT_ON_STARTUP` | `false` | import once when the app is ready |
+| `K8S_IMPORT_ON_STARTUP` | `true` | import once when the app is ready |
 | `K8S_IMPORT_NAMESPACES` | _(all)_ | comma-separated list; nodes and PVs are always imported |
 
 Endpoints:
 
 ```bash
-curl -X POST localhost:8080/api/k8s/import                                   # (re)import the cluster
-curl localhost:8080/api/k8s/releases                                         # Helm releases incl. chart and version
+curl -X POST localhost:8080/api/k8s/import                                   # sync the graph with the cluster
+curl localhost:8080/api/k8s/releases                                         # Helm releases incl. chart, version and revision history
 curl localhost:8080/api/k8s/releases/istio-system/istiod/resources           # release → deployment → replicaset → pod
 curl localhost:8080/api/k8s/releases/istio-system/istiod/config              # ConfigMaps/Secrets used by the release's pods
 curl localhost:8080/api/k8s/configmaps/kube-system/kube-proxy/consumers      # impact: which pods/workloads use it

@@ -9,6 +9,7 @@ import com.example.arrango.model.k8s.ConfigMap;
 import com.example.arrango.model.k8s.DaemonSet;
 import com.example.arrango.model.k8s.Deployment;
 import com.example.arrango.model.k8s.HelmRelease;
+import com.example.arrango.model.k8s.HelmRevision;
 import com.example.arrango.model.k8s.K8sEdge;
 import com.example.arrango.model.k8s.K8sResource;
 import com.example.arrango.model.k8s.Manages;
@@ -49,16 +50,20 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
-import java.util.HashSet;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -66,8 +71,17 @@ import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 
 /**
- * Liest den aktuellen Zustand eines Kubernetes-Clusters und schreibt ihn als Graph nach ArangoDB.
- * Jeder Import ersetzt den vorherigen Stand vollständig (Snapshot).
+ * Liest den aktuellen Zustand eines Kubernetes-Clusters und gleicht ihn mit dem Graph in ArangoDB ab.
+ * <p>
+ * Ein Import löscht nicht den alten Stand, sondern arbeitet inkrementell:
+ * <ul>
+ * <li>Vertices und Kanten haben stabile Keys und werden per {@code UPSERT} angelegt oder aktualisiert.
+ * {@code firstSeen} bleibt erhalten, {@code lastSeen} bekommt den Zeitstempel des Laufs.</li>
+ * <li>Entfernt wird nur, was der Lauf nicht mehr gesehen hat, und nur in seinem Scope: bei gesetztem
+ * {@code k8s.import.namespaces} bleiben andere Namespaces unangetastet.</li>
+ * <li>Helm-Releases sammeln ihre Revisionen in {@code history}, auch über die von Helm aufbewahrten Secrets
+ * hinaus.</li>
+ * </ul>
  */
 @Component
 public class ClusterGraphImporter {
@@ -87,6 +101,35 @@ public class ClusterGraphImporter {
 	private static final List<Class<? extends K8sEdge>> EDGE_TYPES = List.of(
 			Manages.class, Owns.class, Mounts.class, References.class, Selects.class, ScheduledOn.class,
 			UsesServiceAccount.class, Binds.class);
+
+	/**
+	 * Legt neue Dokumente an oder ersetzt vorhandene. {@code firstSeen} überlebt das Ersetzen; {@code %s} ist Platz
+	 * für typ-spezifische Felder, die mit dem alten Stand zusammengeführt werden.
+	 */
+	private static final String UPSERT = """
+			FOR d IN @docs
+			  UPSERT { _key: d._key }
+			  INSERT MERGE(d, { firstSeen: @now, lastSeen: @now })
+			  REPLACE MERGE(d, { firstSeen: OLD.firstSeen || @now, lastSeen: @now }%s)
+			  IN @@collection
+			  RETURN OLD == null
+			""";
+
+	/** Neue Revisionen gewinnen, ältere aus früheren Importen bleiben stehen. */
+	private static final String MERGE_HELM_HISTORY = """
+			, { history: (
+			    FOR h IN APPEND(d.history, (FOR o IN OLD.history || [] FILTER o.revision NOT IN d.history[*].revision RETURN o))
+			      SORT h.revision DESC
+			      RETURN h) }""";
+
+	/** Entfernt, was dieser Lauf nicht gesehen hat; cluster-weite Dokumente ({@code namespace == null}) immer. */
+	private static final String REMOVE_STALE = """
+			FOR d IN @@collection
+			  FILTER d.lastSeen != @now
+			  FILTER @allNamespaces OR d.namespace == null OR d.namespace IN @namespaces
+			  REMOVE d IN @@collection
+			  RETURN 1
+			""";
 
 	/** ownerReferences.kind → Vertex-Collection. */
 	private static final Map<String, String> OWNER_COLLECTIONS = Map.of(
@@ -116,7 +159,7 @@ public class ClusterGraphImporter {
 		}
 	}
 
-	public synchronized Map<String, Integer> importCluster() {
+	public synchronized ImportResult importCluster() {
 		prepareCollections();
 		var snapshot = new Snapshot();
 
@@ -173,28 +216,45 @@ public class ClusterGraphImporter {
 	// ---------------------------------------------------------------- Helm
 
 	private void importHelmReleases(Snapshot snapshot) {
-		var latest = list(ns -> client.secrets().inNamespace(ns).withLabel("owner", "helm").list().getItems(),
+		var byRelease = list(ns -> client.secrets().inNamespace(ns).withLabel("owner", "helm").list().getItems(),
 				() -> client.secrets().inAnyNamespace().withLabel("owner", "helm").list().getItems(), false).stream()
 				.filter(s -> HELM_SECRET_TYPE.equals(s.getType()))
-				.collect(Collectors.toMap(
+				.collect(Collectors.groupingBy(
 						s -> K8sResource.keyOf(s.getMetadata().getNamespace(), s.getMetadata().getLabels().get("name")),
-						s -> s,
-						(a, b) -> revision(a) >= revision(b) ? a : b));
+						LinkedHashMap::new, Collectors.toList()));
 
-		for (var secret : latest.values()) {
-			var labels = secret.getMetadata().getLabels();
-			var release = new HelmRelease(secret.getMetadata().getNamespace(), labels.get("name"));
-			release.setRevision(revision(secret));
-			release.setStatus(labels.get("status"));
-			release.setCreatedAt(secret.getMetadata().getCreationTimestamp());
+		for (var secrets : byRelease.values()) {
+			var history = secrets.stream()
+					.map(this::toRevision)
+					.sorted(Comparator.comparingInt(HelmRevision::getRevision).reversed())
+					.toList();
+			var latest = history.getFirst();
+			var meta = secrets.stream().max(Comparator.comparingInt(ClusterGraphImporter::revision)).orElseThrow()
+					.getMetadata();
+			var release = new HelmRelease(meta.getNamespace(), meta.getLabels().get("name"));
+			release.setRevision(latest.getRevision());
+			release.setStatus(latest.getStatus());
+			release.setChart(latest.getChart());
+			release.setChartVersion(latest.getChartVersion());
+			release.setAppVersion(latest.getAppVersion());
+			release.setCreatedAt(meta.getCreationTimestamp());
 			release.setLabels(Map.of());
-			decodeChart(secret).ifPresent(chart -> {
-				release.setChart(Objects.toString(chart.get("name"), null));
-				release.setChartVersion(Objects.toString(chart.get("version"), null));
-				release.setAppVersion(Objects.toString(chart.get("appVersion"), null));
-			});
+			release.setHistory(history);
 			snapshot.add(release, null);
 		}
+	}
+
+	private HelmRevision toRevision(io.fabric8.kubernetes.api.model.Secret secret) {
+		var revision = new HelmRevision();
+		revision.setRevision(revision(secret));
+		revision.setStatus(secret.getMetadata().getLabels().get("status"));
+		revision.setDeployedAt(secret.getMetadata().getCreationTimestamp());
+		decodeChart(secret).ifPresent(chart -> {
+			revision.setChart(Objects.toString(chart.get("name"), null));
+			revision.setChartVersion(Objects.toString(chart.get("version"), null));
+			revision.setAppVersion(Objects.toString(chart.get("appVersion"), null));
+		});
+		return revision;
 	}
 
 	private static int revision(io.fabric8.kubernetes.api.model.Secret secret) {
@@ -446,8 +506,8 @@ public class ClusterGraphImporter {
 	// ---------------------------------------------------------------- Infrastruktur
 
 	private void prepareCollections() {
-		Stream.concat(VERTEX_TYPES.stream(), EDGE_TYPES.stream())
-				.forEach(type -> operations.collection(type).truncate());
+		// legt fehlende Collections an
+		Stream.concat(VERTEX_TYPES.stream(), EDGE_TYPES.stream()).forEach(operations::collection);
 
 		ArangoDatabase db = operations.driver().db(arangoProperties.database());
 		if (!db.graph(GRAPH).exists()) {
@@ -492,11 +552,12 @@ public class ClusterGraphImporter {
 		return Stream.of(maps).filter(Objects::nonNull).flatMap(m -> m.keySet().stream()).sorted().toList();
 	}
 
-	/** Sammelt Vertices und Kanten eines Imports und schreibt sie am Ende gebündelt. */
+	/** Sammelt Vertices und Kanten eines Imports und gleicht sie am Ende gebündelt mit der Datenbank ab. */
 	private final class Snapshot {
 
 		private final Map<Class<?>, List<Object>> documents = new LinkedHashMap<>();
-		private final Set<String> ids = new HashSet<>();
+		/** Dokument-ID → Namespace ({@code null} bei cluster-weiten Ressourcen). */
+		private final Map<String, String> namespaces = new HashMap<>();
 		private final List<K8sEdge> edges = new ArrayList<>();
 
 		void add(K8sResource resource, ObjectMeta meta) {
@@ -508,7 +569,8 @@ public class ClusterGraphImporter {
 				helmEdge(resource, meta);
 			}
 			documents.computeIfAbsent(resource.getClass(), k -> new ArrayList<>()).add(resource);
-			ids.add(operations.collection(resource.getClass()).name() + "/" + resource.getKey());
+			namespaces.put(operations.collection(resource.getClass()).name() + "/" + resource.getKey(),
+					resource.getNamespace());
 		}
 
 		void edge(K8sEdge edge) {
@@ -546,27 +608,72 @@ public class ClusterGraphImporter {
 					operations.collection(resource.getClass()).name() + "/" + resource.getKey()));
 		}
 
-		@SuppressWarnings({ "unchecked", "rawtypes" })
-		Map<String, Integer> save() {
-			var counts = new LinkedHashMap<String, Integer>();
-			documents.forEach((type, docs) -> {
-				operations.insertAll(docs, (Class) type);
-				counts.put(operations.collection(type).name(), docs.size());
-			});
+		ImportResult save() {
+			var now = Instant.now().toString();
+			var changes = new LinkedHashMap<String, ImportResult.Changes>();
 
 			// Kanten auf Ressourcen, die nicht importiert wurden (z. B. optionales Secret, das fehlt), werden verworfen.
-			var resolved = edges.stream()
-					.filter(e -> ids.contains(e.getFrom()) && ids.contains(e.getTo()))
-					.collect(Collectors.groupingBy(Object::getClass, LinkedHashMap::new, Collectors.toList()));
-			resolved.forEach((type, list) -> {
-				operations.insertAll(list, (Class) type);
-				counts.put(operations.collection(type).name(), list.size());
-			});
-			var dropped = edges.size() - resolved.values().stream().mapToInt(Collection::size).sum();
+			var resolved = new LinkedHashMap<Class<?>, Map<String, Object>>();
+			int dropped = 0;
+			for (K8sEdge edge : edges) {
+				if (!namespaces.containsKey(edge.getFrom()) || !namespaces.containsKey(edge.getTo())) {
+					dropped++;
+					continue;
+				}
+				edge.setKey(edgeKey(edge));
+				edge.setNamespace(namespaces.get(edge.getFrom()));
+				resolved.computeIfAbsent(edge.getClass(), k -> new LinkedHashMap<>()).putIfAbsent(edge.getKey(), edge);
+			}
 			if (dropped > 0) {
 				log.debug("{} Kanten ohne importiertes Ziel verworfen", dropped);
 			}
-			return counts;
+
+			for (var type : VERTEX_TYPES) {
+				var extra = type == HelmRelease.class ? MERGE_HELM_HISTORY : "";
+				sync(type, documents.getOrDefault(type, List.of()), extra, now, changes);
+			}
+			for (var type : EDGE_TYPES) {
+				sync(type, resolved.getOrDefault(type, Map.of()).values(), "", now, changes);
+			}
+			return new ImportResult(now, changes);
+		}
+
+		private void sync(Class<?> type, Collection<?> docs, String extraMerge, String now,
+				Map<String, ImportResult.Changes> changes) {
+			var collection = operations.collection(type).name();
+			var json = docs.stream().map(operations.getConverter()::write).toList();
+
+			int inserted = 0;
+			int updated = 0;
+			if (!json.isEmpty()) {
+				for (Boolean isNew : operations.query(UPSERT.formatted(extraMerge),
+						Map.of("docs", json, "now", now, "@collection", collection), Boolean.class)) {
+					if (isNew) {
+						inserted++;
+					}
+					else {
+						updated++;
+					}
+				}
+			}
+			int removed = operations.query(REMOVE_STALE,
+					Map.of("now", now, "@collection", collection, "allNamespaces", properties.namespaces().isEmpty(),
+							"namespaces", properties.namespaces()),
+					Integer.class).asListRemaining().size();
+			changes.put(collection, new ImportResult.Changes(inserted, updated, removed));
+		}
+	}
+
+	/** Stabiler Key aus Typ, Endpunkten und {@link K8sEdge#identity()}. */
+	private static String edgeKey(K8sEdge edge) {
+		try {
+			var digest = MessageDigest.getInstance("SHA-256").digest(
+					String.join("\n", edge.getClass().getSimpleName(), edge.getFrom(), edge.getTo(), edge.identity())
+							.getBytes(StandardCharsets.UTF_8));
+			return HexFormat.of().formatHex(digest, 0, 16);
+		}
+		catch (NoSuchAlgorithmException e) {
+			throw new IllegalStateException(e);
 		}
 	}
 }
