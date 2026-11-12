@@ -20,6 +20,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.mockito.ArgumentMatchers;
+
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -52,7 +54,7 @@ class ArangoRecorder {
 		when(converter.write(any())).thenAnswer(inv -> new POJONode(inv.getArgument(0)));
 		when(operations.getConverter()).thenReturn(converter);
 
-		when(operations.collection(any(Class.class))).thenAnswer(inv -> {
+		when(operations.collection(ArgumentMatchers.<Class<?>>any())).thenAnswer(inv -> {
 			var collection = mock(CollectionOperations.class);
 			var name = collectionName(inv.getArgument(0));
 			when(collection.name()).thenReturn(name);
@@ -64,7 +66,7 @@ class ArangoRecorder {
 		when(driver.db(anyString())).thenReturn(database);
 		when(database.graph(ClusterGraphImporter.GRAPH)).thenReturn(graph);
 
-		when(operations.query(anyString(), anyMap(), any(Class.class))).thenAnswer(inv -> {
+		when(operations.query(anyString(), anyMap(), ArgumentMatchers.<Class<Object>>any())).thenAnswer(inv -> {
 			String query = inv.getArgument(0);
 			Map<String, Object> params = inv.getArgument(1);
 			var collection = (String) params.get("@collection");
