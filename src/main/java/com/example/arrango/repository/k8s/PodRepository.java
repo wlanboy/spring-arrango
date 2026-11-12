@@ -13,8 +13,6 @@ public interface PodRepository extends ArangoRepository<Pod, String> {
 
 	List<Pod> findByNodeName(String nodeName);
 
-	List<Pod> findByPhaseNot(String phase);
-
 	/** Pods, die ein Service per Label-Selector erreicht. */
 	@Query("""
 			FOR pod IN 1 OUTBOUND CONCAT('services/', @namespace, '.', @name) selects

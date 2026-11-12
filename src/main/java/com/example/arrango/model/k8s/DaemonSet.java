@@ -13,7 +13,11 @@ public class DaemonSet extends K8sResource {
 
 	private int ready;
 
+	/** {@code spec.selector.matchLabels}. */
 	private Map<String, String> selector;
+
+	/** {@code spec.selector.matchExpressions}; leer, wenn der Selector nur matchLabels hat. */
+	private List<SelectorRequirement> matchExpressions;
 
 	private List<String> images;
 
@@ -46,6 +50,14 @@ public class DaemonSet extends K8sResource {
 
 	public void setSelector(Map<String, String> selector) {
 		this.selector = selector;
+	}
+
+	public List<SelectorRequirement> getMatchExpressions() {
+		return matchExpressions;
+	}
+
+	public void setMatchExpressions(List<SelectorRequirement> matchExpressions) {
+		this.matchExpressions = matchExpressions;
 	}
 
 	public List<String> getImages() {

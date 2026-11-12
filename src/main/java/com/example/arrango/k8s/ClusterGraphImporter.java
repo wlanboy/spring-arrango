@@ -6,14 +6,18 @@ import com.arangodb.springframework.core.ArangoOperations;
 import com.example.arrango.config.ArangoProperties;
 import com.example.arrango.model.k8s.Binds;
 import com.example.arrango.model.k8s.ConfigMap;
+import com.example.arrango.model.k8s.Contains;
+import com.example.arrango.model.k8s.CronJob;
 import com.example.arrango.model.k8s.DaemonSet;
 import com.example.arrango.model.k8s.Deployment;
 import com.example.arrango.model.k8s.HelmRelease;
 import com.example.arrango.model.k8s.HelmRevision;
+import com.example.arrango.model.k8s.Job;
 import com.example.arrango.model.k8s.K8sEdge;
 import com.example.arrango.model.k8s.K8sResource;
 import com.example.arrango.model.k8s.Manages;
 import com.example.arrango.model.k8s.Mounts;
+import com.example.arrango.model.k8s.Namespace;
 import com.example.arrango.model.k8s.Node;
 import com.example.arrango.model.k8s.Owns;
 import com.example.arrango.model.k8s.PersistentVolume;
@@ -23,15 +27,20 @@ import com.example.arrango.model.k8s.References;
 import com.example.arrango.model.k8s.ReplicaSet;
 import com.example.arrango.model.k8s.ScheduledOn;
 import com.example.arrango.model.k8s.Secret;
+import com.example.arrango.model.k8s.SelectorRequirement;
 import com.example.arrango.model.k8s.Selects;
 import com.example.arrango.model.k8s.Service;
 import com.example.arrango.model.k8s.ServiceAccount;
 import com.example.arrango.model.k8s.StatefulSet;
+import com.example.arrango.model.k8s.StorageClass;
 import com.example.arrango.model.k8s.UsesServiceAccount;
+import com.example.arrango.model.k8s.UsesStorageClass;
+import io.fabric8.kubernetes.api.model.batch.v1.JobCondition;
 import io.fabric8.kubernetes.api.model.Container;
 import io.fabric8.kubernetes.api.model.EnvFromSource;
 import io.fabric8.kubernetes.api.model.EnvVar;
 import io.fabric8.kubernetes.api.model.HasMetadata;
+import io.fabric8.kubernetes.api.model.LabelSelector;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.OwnerReference;
 import io.fabric8.kubernetes.api.model.PodSpec;
@@ -64,7 +73,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -93,14 +105,13 @@ public class ClusterGraphImporter {
 
 	private static final String HELM_SECRET_TYPE = "helm.sh/release.v1";
 
-	private static final List<Class<? extends K8sResource>> VERTEX_TYPES = List.of(
-			HelmRelease.class, Deployment.class, StatefulSet.class, DaemonSet.class, ReplicaSet.class, Pod.class,
-			Service.class, ConfigMap.class, Secret.class, ServiceAccount.class, Node.class,
-			PersistentVolumeClaim.class, PersistentVolume.class);
+	private static final List<Class<? extends K8sResource>> VERTEX_TYPES = ResourceType.entityClasses();
 
 	private static final List<Class<? extends K8sEdge>> EDGE_TYPES = List.of(
-			Manages.class, Owns.class, Mounts.class, References.class, Selects.class, ScheduledOn.class,
-			UsesServiceAccount.class, Binds.class);
+			Contains.class, Manages.class, Owns.class, Mounts.class, References.class, Selects.class,
+			ScheduledOn.class, UsesServiceAccount.class, Binds.class, UsesStorageClass.class);
+
+	private static final String DEFAULT_STORAGE_CLASS = "storageclass.kubernetes.io/is-default-class";
 
 	/**
 	 * Legt neue Dokumente an oder ersetzt vorhandene. {@code firstSeen} überlebt das Ersetzen; {@code %s} ist Platz
@@ -122,11 +133,31 @@ public class ClusterGraphImporter {
 			      SORT h.revision DESC
 			      RETURN h) }""";
 
-	/** Entfernt, was dieser Lauf nicht gesehen hat; cluster-weite Dokumente ({@code namespace == null}) immer. */
-	private static final String REMOVE_STALE = """
+	/**
+	 * Entfernt Vertices, die dieser Lauf nicht gesehen hat; cluster-weite Dokumente ({@code namespace == null}) immer.
+	 * Namespaces, die der Lauf nicht lesen konnte ({@code @failedNamespaces}), bleiben stehen.
+	 */
+	private static final String REMOVE_STALE_VERTICES = """
 			FOR d IN @@collection
 			  FILTER d.lastSeen != @now
 			  FILTER @allNamespaces OR d.namespace == null OR d.namespace IN @namespaces
+			  FILTER d.namespace NOT IN @failedNamespaces
+			  REMOVE d IN @@collection
+			  RETURN 1
+			""";
+
+	/**
+	 * Wie {@link #REMOVE_STALE_VERTICES} für Kanten. Kanten, deren Start oder Ziel in einer nicht lesbaren
+	 * Collection ({@code @failedCollections}) oder einem nicht lesbaren Namespace einer Collection
+	 * ({@code @failedScopes}, Form {@code <collection>/<namespace>}) liegt, bleiben stehen.
+	 */
+	private static final String REMOVE_STALE_EDGES = """
+			FOR d IN @@collection
+			  FILTER d.lastSeen != @now
+			  FILTER @allNamespaces OR d.namespace == null OR d.namespace IN @namespaces
+			  LET ends = [PARSE_IDENTIFIER(d._from).collection, PARSE_IDENTIFIER(d._to).collection]
+			  FILTER LENGTH(INTERSECTION(ends, @failedCollections)) == 0
+			  FILTER LENGTH(INTERSECTION(ends[* RETURN CONCAT(CURRENT, '/', d.namespace)], @failedScopes)) == 0
 			  REMOVE d IN @@collection
 			  RETURN 1
 			""";
@@ -136,7 +167,9 @@ public class ClusterGraphImporter {
 			"Deployment", "deployments",
 			"StatefulSet", "stateful_sets",
 			"DaemonSet", "daemon_sets",
-			"ReplicaSet", "replica_sets");
+			"ReplicaSet", "replica_sets",
+			"CronJob", "cron_jobs",
+			"Job", "jobs");
 
 	private final KubernetesClient client;
 	private final ArangoOperations operations;
@@ -151,64 +184,116 @@ public class ClusterGraphImporter {
 		this.properties = properties;
 	}
 
+	/**
+	 * Läuft in einem eigenen Thread, damit ein langsamer oder nicht erreichbarer Cluster (fabric8 wiederholt
+	 * fehlgeschlagene Requests mit Backoff) die Readiness nicht blockiert. Fehler werden nur geloggt: Die App soll
+	 * auch ohne erreichbaren Cluster oder ArangoDB hochkommen, der Import lässt sich später über
+	 * {@code POST /api/k8s/import} nachholen.
+	 */
 	@EventListener(ApplicationReadyEvent.class)
 	void importOnStartup() {
 		if (properties.onStartup()) {
-			log.info("Import aus Kubernetes-Kontext '{}': {}", client.getConfiguration().getCurrentContext().getName(),
-					importCluster());
+			Thread.ofVirtual().name("k8s-startup-import").start(this::runStartupImport);
 		}
+	}
+
+	private void runStartupImport() {
+		try {
+			var result = importCluster();
+			log.info("Import aus Kubernetes-Kontext '{}': {}", contextName(), result.collections());
+			result.failures().forEach(f -> log.warn("Nicht importiert: {}{}: {}", f.collection(),
+					f.namespace() == null ? "" : " in " + f.namespace(), f.error()));
+		}
+		catch (RuntimeException e) {
+			log.error("Import beim Start fehlgeschlagen, der Graph bleibt auf dem alten Stand", e);
+		}
+	}
+
+	private String contextName() {
+		var context = client.getConfiguration().getCurrentContext();
+		return context != null ? context.getName() : client.getConfiguration().getMasterUrl();
 	}
 
 	public synchronized ImportResult importCluster() {
 		prepareCollections();
 		var snapshot = new Snapshot();
 
-		list(ns -> client.nodes().list().getItems(), () -> client.nodes().list().getItems(), true)
-				.forEach(n -> snapshot.add(toNode(n), n.getMetadata()));
-		list(ns -> client.persistentVolumes().list().getItems(), () -> client.persistentVolumes().list().getItems(), true)
-				.forEach(pv -> snapshot.add(toPersistentVolume(pv), pv.getMetadata()));
+		// Namespaces immer vollständig: Sie sind cluster-weit und Start der contains-Kanten auch außerhalb des Scopes.
+		load(snapshot, Namespace.class, true, null, () -> client.namespaces().list().getItems(),
+				ClusterGraphImporter::toNamespace);
+		load(snapshot, Node.class, true, null, () -> client.nodes().list().getItems(),
+				ClusterGraphImporter::toNode);
+		load(snapshot, StorageClass.class, true, null,
+				() -> client.storage().v1().storageClasses().list().getItems(),
+				ClusterGraphImporter::toStorageClass);
+		var pvs = load(snapshot, PersistentVolume.class, true, null,
+				() -> client.persistentVolumes().list().getItems(),
+				ClusterGraphImporter::toPersistentVolume);
 
 		importHelmReleases(snapshot);
 
-		list(ns -> client.apps().deployments().inNamespace(ns).list().getItems(),
-				() -> client.apps().deployments().inAnyNamespace().list().getItems(), false)
-				.forEach(d -> snapshot.add(toDeployment(d), d.getMetadata()));
-		list(ns -> client.apps().statefulSets().inNamespace(ns).list().getItems(),
-				() -> client.apps().statefulSets().inAnyNamespace().list().getItems(), false)
-				.forEach(s -> snapshot.add(toStatefulSet(s), s.getMetadata()));
-		list(ns -> client.apps().daemonSets().inNamespace(ns).list().getItems(),
-				() -> client.apps().daemonSets().inAnyNamespace().list().getItems(), false)
-				.forEach(d -> snapshot.add(toDaemonSet(d), d.getMetadata()));
-		list(ns -> client.apps().replicaSets().inNamespace(ns).list().getItems(),
-				() -> client.apps().replicaSets().inAnyNamespace().list().getItems(), false)
-				.forEach(r -> snapshot.add(toReplicaSet(r), r.getMetadata()));
-		list(ns -> client.configMaps().inNamespace(ns).list().getItems(),
-				() -> client.configMaps().inAnyNamespace().list().getItems(), false)
-				.forEach(c -> snapshot.add(toConfigMap(c), c.getMetadata()));
-		list(ns -> client.secrets().inNamespace(ns).list().getItems(),
-				() -> client.secrets().inAnyNamespace().list().getItems(), false).stream()
-				.filter(s -> !HELM_SECRET_TYPE.equals(s.getType()))
-				.forEach(s -> snapshot.add(toSecret(s), s.getMetadata()));
-		list(ns -> client.serviceAccounts().inNamespace(ns).list().getItems(),
-				() -> client.serviceAccounts().inAnyNamespace().list().getItems(), false)
-				.forEach(sa -> snapshot.add(toServiceAccount(sa), sa.getMetadata()));
-		var pvcs = list(ns -> client.persistentVolumeClaims().inNamespace(ns).list().getItems(),
-				() -> client.persistentVolumeClaims().inAnyNamespace().list().getItems(), false);
-		pvcs.forEach(pvc -> snapshot.add(toPersistentVolumeClaim(pvc), pvc.getMetadata()));
-		var pods = list(ns -> client.pods().inNamespace(ns).list().getItems(),
-				() -> client.pods().inAnyNamespace().list().getItems(), false);
-		pods.forEach(p -> snapshot.add(toPod(p), p.getMetadata()));
-		var services = list(ns -> client.services().inNamespace(ns).list().getItems(),
-				() -> client.services().inAnyNamespace().list().getItems(), false);
-		services.forEach(s -> snapshot.add(toService(s), s.getMetadata()));
+		load(snapshot, Deployment.class, false,
+				ns -> client.apps().deployments().inNamespace(ns).list().getItems(),
+				() -> client.apps().deployments().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toDeployment);
+		load(snapshot, StatefulSet.class, false,
+				ns -> client.apps().statefulSets().inNamespace(ns).list().getItems(),
+				() -> client.apps().statefulSets().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toStatefulSet);
+		load(snapshot, DaemonSet.class, false,
+				ns -> client.apps().daemonSets().inNamespace(ns).list().getItems(),
+				() -> client.apps().daemonSets().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toDaemonSet);
+		load(snapshot, ReplicaSet.class, false,
+				ns -> client.apps().replicaSets().inNamespace(ns).list().getItems(),
+				() -> client.apps().replicaSets().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toReplicaSet);
+		load(snapshot, CronJob.class, false,
+				ns -> client.batch().v1().cronjobs().inNamespace(ns).list().getItems(),
+				() -> client.batch().v1().cronjobs().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toCronJob);
+		load(snapshot, Job.class, false,
+				ns -> client.batch().v1().jobs().inNamespace(ns).list().getItems(),
+				() -> client.batch().v1().jobs().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toJob);
+		load(snapshot, ConfigMap.class, false,
+				ns -> client.configMaps().inNamespace(ns).list().getItems(),
+				() -> client.configMaps().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toConfigMap);
+		// Helm-Release-Secrets (owner=helm) gar nicht erst übertragen; die laufen über importHelmReleases.
+		load(snapshot, Secret.class, false,
+				ns -> client.secrets().inNamespace(ns).withoutLabel("owner", "helm").list().getItems(),
+				() -> client.secrets().inAnyNamespace().withoutLabel("owner", "helm").list().getItems(),
+				ClusterGraphImporter::toSecret);
+		load(snapshot, ServiceAccount.class, false,
+				ns -> client.serviceAccounts().inNamespace(ns).list().getItems(),
+				() -> client.serviceAccounts().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toServiceAccount);
+		var pvcs = load(snapshot, PersistentVolumeClaim.class, false,
+				ns -> client.persistentVolumeClaims().inNamespace(ns).list().getItems(),
+				() -> client.persistentVolumeClaims().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toPersistentVolumeClaim);
+		var pods = load(snapshot, Pod.class, false,
+				ns -> client.pods().inNamespace(ns).list().getItems(),
+				() -> client.pods().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toPod);
+		var services = load(snapshot, Service.class, false,
+				ns -> client.services().inNamespace(ns).list().getItems(),
+				() -> client.services().inAnyNamespace().list().getItems(),
+				ClusterGraphImporter::toService);
 
-		pods.forEach(p -> podEdges(p, snapshot));
-		services.forEach(s -> serviceEdges(s, pods, snapshot));
-		pvcs.stream()
-				.filter(pvc -> pvc.getSpec().getVolumeName() != null)
-				.forEach(pvc -> snapshot.edge(new Binds(
-						id("persistent_volume_claims", pvc.getMetadata()),
-						"persistent_volumes/" + pvc.getSpec().getVolumeName())));
+		forEachSafely(snapshot, Pod.class, pods, p -> podEdges(p, snapshot));
+		forEachSafely(snapshot, Service.class, services, s -> serviceEdges(s, pods, snapshot));
+		forEachSafely(snapshot, PersistentVolumeClaim.class, pvcs, pvc -> {
+			if (pvc.getSpec().getVolumeName() != null) {
+				snapshot.edge(new Binds(id("persistent_volume_claims", pvc.getMetadata()),
+						"persistent_volumes/" + pvc.getSpec().getVolumeName()));
+			}
+			storageClassEdge(id("persistent_volume_claims", pvc.getMetadata()), pvc.getSpec().getStorageClassName(),
+					snapshot);
+		});
+		forEachSafely(snapshot, PersistentVolume.class, pvs, pv -> storageClassEdge(
+				id("persistent_volumes", pv.getMetadata()), pv.getSpec().getStorageClassName(), snapshot));
 
 		return snapshot.save();
 	}
@@ -216,14 +301,15 @@ public class ClusterGraphImporter {
 	// ---------------------------------------------------------------- Helm
 
 	private void importHelmReleases(Snapshot snapshot) {
-		var byRelease = list(ns -> client.secrets().inNamespace(ns).withLabel("owner", "helm").list().getItems(),
-				() -> client.secrets().inAnyNamespace().withLabel("owner", "helm").list().getItems(), false).stream()
+		var byRelease = fetch(snapshot, HelmRelease.class, false,
+				ns -> client.secrets().inNamespace(ns).withLabel("owner", "helm").list().getItems(),
+				() -> client.secrets().inAnyNamespace().withLabel("owner", "helm").list().getItems()).stream()
 				.filter(s -> HELM_SECRET_TYPE.equals(s.getType()))
 				.collect(Collectors.groupingBy(
 						s -> K8sResource.keyOf(s.getMetadata().getNamespace(), s.getMetadata().getLabels().get("name")),
 						LinkedHashMap::new, Collectors.toList()));
 
-		for (var secrets : byRelease.values()) {
+		forEachSafely(snapshot, HelmRelease.class, byRelease.values(), secrets -> {
 			var history = secrets.stream()
 					.map(this::toRevision)
 					.sorted(Comparator.comparingInt(HelmRevision::getRevision).reversed())
@@ -241,7 +327,7 @@ public class ClusterGraphImporter {
 			release.setLabels(Map.of());
 			release.setHistory(history);
 			snapshot.add(release, null);
-		}
+		});
 	}
 
 	private HelmRevision toRevision(io.fabric8.kubernetes.api.model.Secret secret) {
@@ -292,6 +378,23 @@ public class ClusterGraphImporter {
 
 	// ---------------------------------------------------------------- Mapping
 
+	private static Namespace toNamespace(io.fabric8.kubernetes.api.model.Namespace n) {
+		var namespace = new Namespace(n.getMetadata().getName());
+		namespace.setPhase(n.getStatus() == null ? null : n.getStatus().getPhase());
+		return namespace;
+	}
+
+	private static StorageClass toStorageClass(io.fabric8.kubernetes.api.model.storage.StorageClass sc) {
+		var storageClass = new StorageClass(sc.getMetadata().getName());
+		storageClass.setProvisioner(sc.getProvisioner());
+		storageClass.setReclaimPolicy(sc.getReclaimPolicy());
+		storageClass.setVolumeBindingMode(sc.getVolumeBindingMode());
+		storageClass.setAllowVolumeExpansion(Boolean.TRUE.equals(sc.getAllowVolumeExpansion()));
+		var annotations = sc.getMetadata().getAnnotations();
+		storageClass.setDefaultClass(annotations != null && "true".equals(annotations.get(DEFAULT_STORAGE_CLASS)));
+		return storageClass;
+	}
+
 	private static Node toNode(io.fabric8.kubernetes.api.model.Node n) {
 		var node = new Node(null, n.getMetadata().getName());
 		node.setKubeletVersion(n.getStatus().getNodeInfo().getKubeletVersion());
@@ -317,6 +420,7 @@ public class ClusterGraphImporter {
 		deployment.setReplicas(orZero(d.getSpec().getReplicas()));
 		deployment.setReadyReplicas(orZero(d.getStatus().getReadyReplicas()));
 		deployment.setSelector(d.getSpec().getSelector().getMatchLabels());
+		deployment.setMatchExpressions(matchExpressions(d.getSpec().getSelector()));
 		deployment.setImages(images(d.getSpec().getTemplate().getSpec()));
 		return deployment;
 	}
@@ -326,6 +430,7 @@ public class ClusterGraphImporter {
 		statefulSet.setReplicas(orZero(s.getSpec().getReplicas()));
 		statefulSet.setReadyReplicas(orZero(s.getStatus().getReadyReplicas()));
 		statefulSet.setSelector(s.getSpec().getSelector().getMatchLabels());
+		statefulSet.setMatchExpressions(matchExpressions(s.getSpec().getSelector()));
 		statefulSet.setImages(images(s.getSpec().getTemplate().getSpec()));
 		return statefulSet;
 	}
@@ -335,6 +440,7 @@ public class ClusterGraphImporter {
 		daemonSet.setDesired(orZero(d.getStatus().getDesiredNumberScheduled()));
 		daemonSet.setReady(orZero(d.getStatus().getNumberReady()));
 		daemonSet.setSelector(d.getSpec().getSelector().getMatchLabels());
+		daemonSet.setMatchExpressions(matchExpressions(d.getSpec().getSelector()));
 		daemonSet.setImages(images(d.getSpec().getTemplate().getSpec()));
 		return daemonSet;
 	}
@@ -344,6 +450,51 @@ public class ClusterGraphImporter {
 		replicaSet.setReplicas(orZero(r.getSpec().getReplicas()));
 		replicaSet.setReadyReplicas(orZero(r.getStatus().getReadyReplicas()));
 		return replicaSet;
+	}
+
+	private static CronJob toCronJob(io.fabric8.kubernetes.api.model.batch.v1.CronJob c) {
+		var cronJob = new CronJob(c.getMetadata().getNamespace(), c.getMetadata().getName());
+		var spec = c.getSpec();
+		cronJob.setSchedule(spec.getSchedule());
+		cronJob.setTimeZone(spec.getTimeZone());
+		cronJob.setSuspend(Boolean.TRUE.equals(spec.getSuspend()));
+		var status = c.getStatus();
+		if (status != null) {
+			cronJob.setLastScheduleTime(status.getLastScheduleTime());
+			cronJob.setLastSuccessfulTime(status.getLastSuccessfulTime());
+			cronJob.setActiveJobs(status.getActive() == null ? 0 : status.getActive().size());
+		}
+		cronJob.setImages(images(spec.getJobTemplate().getSpec().getTemplate().getSpec()));
+		return cronJob;
+	}
+
+	private static Job toJob(io.fabric8.kubernetes.api.model.batch.v1.Job j) {
+		var job = new Job(j.getMetadata().getNamespace(), j.getMetadata().getName());
+		job.setCompletions(j.getSpec().getCompletions());
+		job.setParallelism(j.getSpec().getParallelism());
+		job.setImages(images(j.getSpec().getTemplate().getSpec()));
+		var status = j.getStatus();
+		if (status != null) {
+			job.setActive(orZero(status.getActive()));
+			job.setSucceeded(orZero(status.getSucceeded()));
+			job.setFailed(orZero(status.getFailed()));
+			job.setStartTime(status.getStartTime());
+			job.setCompletionTime(status.getCompletionTime());
+		}
+		job.setStatus(jobStatus(j));
+		return job;
+	}
+
+	/** Terminale Conditions zuerst; ohne sie läuft der Job (oder wartet auf seinen ersten Pod). */
+	private static String jobStatus(io.fabric8.kubernetes.api.model.batch.v1.Job j) {
+		var conditions = j.getStatus() == null || j.getStatus().getConditions() == null
+				? List.<JobCondition>of() : j.getStatus().getConditions();
+		for (var type : List.of("Complete", "Failed", "Suspended")) {
+			if (conditions.stream().anyMatch(c -> type.equals(c.getType()) && "True".equals(c.getStatus()))) {
+				return type;
+			}
+		}
+		return "Running";
 	}
 
 	private static ConfigMap toConfigMap(io.fabric8.kubernetes.api.model.ConfigMap c) {
@@ -480,6 +631,13 @@ public class ClusterGraphImporter {
 				.forEach(p -> snapshot.edge(new Selects(serviceId, id("pods", p.getMetadata()))));
 	}
 
+	/** Leerer {@code storageClassName} heißt in Kubernetes ausdrücklich "keine Klasse". */
+	private static void storageClassEdge(String fromId, String storageClassName, Snapshot snapshot) {
+		if (storageClassName != null && !storageClassName.isEmpty()) {
+			snapshot.edge(new UsesStorageClass(fromId, "storage_classes/" + storageClassName));
+		}
+	}
+
 	private static Mounts mount(String podId, String collection, String ns, String name, Volume volume, String source,
 			List<String> mountPaths, Boolean optional) {
 		var mounts = new Mounts(podId, collection + "/" + K8sResource.keyOf(ns, name));
@@ -509,29 +667,131 @@ public class ClusterGraphImporter {
 		// legt fehlende Collections an
 		Stream.concat(VERTEX_TYPES.stream(), EDGE_TYPES.stream()).forEach(operations::collection);
 
+		var vertexCollections = VERTEX_TYPES.stream().map(t -> operations.collection(t).name()).toArray(String[]::new);
+		var edgeDefinitions = EDGE_TYPES.stream()
+				.map(t -> new EdgeDefinition()
+						.collection(operations.collection(t).name())
+						.from(vertexCollections)
+						.to(vertexCollections))
+				.toList();
+
 		ArangoDatabase db = operations.driver().db(arangoProperties.database());
-		if (!db.graph(GRAPH).exists()) {
-			var vertexCollections = VERTEX_TYPES.stream().map(t -> operations.collection(t).name()).toArray(String[]::new);
-			var edgeDefinitions = EDGE_TYPES.stream()
-					.map(t -> new EdgeDefinition()
-							.collection(operations.collection(t).name())
-							.from(vertexCollections)
-							.to(vertexCollections))
-					.toList();
+		var graph = db.graph(GRAPH);
+		if (!graph.exists()) {
 			db.createGraph(GRAPH, edgeDefinitions);
+			return;
+		}
+
+		// Bestehenden Graph nachziehen, wenn Vertex- oder Edge-Typen dazugekommen sind. Nicht mehr benötigte
+		// Edge-Definitionen bleiben stehen, damit kein Update Daten aus dem Graph entfernt.
+		var existing = graph.getInfo().getEdgeDefinitions().stream()
+				.collect(Collectors.toMap(EdgeDefinition::getCollection, Function.identity()));
+		for (var wanted : edgeDefinitions) {
+			var current = existing.get(wanted.getCollection());
+			if (current == null) {
+				log.info("Graph {}: Edge-Definition {} hinzugefügt", GRAPH, wanted.getCollection());
+				graph.addEdgeDefinition(wanted);
+			}
+			else if (!Set.copyOf(current.getFrom()).containsAll(wanted.getFrom())
+					|| !Set.copyOf(current.getTo()).containsAll(wanted.getTo())) {
+				log.info("Graph {}: Edge-Definition {} um neue Vertex-Collections erweitert", GRAPH,
+						wanted.getCollection());
+				var merged = new EdgeDefinition()
+						.collection(wanted.getCollection())
+						.from(union(current.getFrom(), wanted.getFrom()))
+						.to(union(current.getTo(), wanted.getTo()));
+				graph.replaceEdgeDefinition(merged);
+			}
 		}
 	}
 
-	private <T extends HasMetadata> List<T> list(Function<String, List<T>> perNamespace, Supplier<List<T>> all,
-			boolean clusterScoped) {
+	private static String[] union(Collection<String> a, Collection<String> b) {
+		return Stream.concat(a.stream(), b.stream()).distinct().toArray(String[]::new);
+	}
+
+	/**
+	 * Liest einen Ressourcentyp, übernimmt ihn in den Snapshot und gibt die gelesenen Objekte zurück. Fehler beim
+	 * Lesen oder Abbilden brechen den Import nicht ab, sondern landen in {@link ImportResult#failures()}.
+	 */
+	private <T extends HasMetadata> List<T> load(Snapshot snapshot, Class<? extends K8sResource> type,
+			boolean clusterScoped, Function<String, List<T>> perNamespace, Supplier<List<T>> all,
+			Function<T, ? extends K8sResource> mapper) {
+		var items = fetch(snapshot, type, clusterScoped, perNamespace, all);
+		forEachSafely(snapshot, type, items, item -> snapshot.add(mapper.apply(item), item.getMetadata()));
+		return items;
+	}
+
+	/** Liest einen Ressourcentyp, bei gesetzten Namespaces jeden Namespace für sich. */
+	private <T> List<T> fetch(Snapshot snapshot, Class<?> type, boolean clusterScoped,
+			Function<String, List<T>> perNamespace, Supplier<List<T>> all) {
 		if (clusterScoped || properties.namespaces().isEmpty()) {
-			return all.get();
+			return attempt(snapshot, type, null, all);
 		}
-		return properties.namespaces().stream().flatMap(ns -> perNamespace.apply(ns).stream()).toList();
+		return properties.namespaces().stream()
+				.flatMap(ns -> attempt(snapshot, type, ns, () -> perNamespace.apply(ns)).stream())
+				.toList();
+	}
+
+	private <T> List<T> attempt(Snapshot snapshot, Class<?> type, String namespace, Supplier<List<T>> call) {
+		try {
+			return call.get();
+		}
+		catch (RuntimeException e) {
+			snapshot.fail(type, namespace, e);
+			return List.of();
+		}
+	}
+
+	/** Ein fehlerhaftes Objekt sperrt nur seinen Namespace (bzw. bei cluster-weiten Objekten den Typ). */
+	private static <T> void forEachSafely(Snapshot snapshot, Class<?> type, Collection<T> items, Consumer<T> action) {
+		for (T item : items) {
+			try {
+				action.accept(item);
+			}
+			catch (RuntimeException e) {
+				snapshot.fail(type, namespaceOf(item), e);
+			}
+		}
+	}
+
+	/**
+	 * fabric8 verpackt die eigentliche Ursache (z. B. 403 Forbidden, Connection refused) in "Operation ... failed";
+	 * deshalb hängt die Ursachenkette mit an.
+	 */
+	private static String describe(Throwable e) {
+		var parts = new ArrayList<String>();
+		parts.add(Objects.requireNonNullElse(e.getMessage(), e.getClass().getName()).strip());
+		for (var cause = e.getCause(); cause != null && cause != cause.getCause(); cause = cause.getCause()) {
+			var message = cause.getMessage();
+			if (message == null || !parts.getFirst().contains(message.strip())) {
+				parts.add(cause.getClass().getSimpleName() + (message == null ? "" : ": " + message.strip()));
+			}
+		}
+		return String.join(" <- ", parts);
+	}
+
+	private static String namespaceOf(Object item) {
+		if (item instanceof HasMetadata h) {
+			return h.getMetadata().getNamespace();
+		}
+		if (item instanceof List<?> l && !l.isEmpty()) {
+			return namespaceOf(l.getFirst());
+		}
+		return null;
 	}
 
 	private static String id(String collection, ObjectMeta meta) {
 		return collection + "/" + K8sResource.keyOf(meta.getNamespace(), meta.getName());
+	}
+
+	private static List<SelectorRequirement> matchExpressions(LabelSelector selector) {
+		if (selector == null || selector.getMatchExpressions() == null) {
+			return List.of();
+		}
+		return selector.getMatchExpressions().stream()
+				.map(e -> new SelectorRequirement(e.getKey(), e.getOperator(),
+						e.getValues() == null ? List.of() : e.getValues()))
+				.toList();
 	}
 
 	private static int orZero(Integer value) {
@@ -559,6 +819,32 @@ public class ClusterGraphImporter {
 		/** Dokument-ID → Namespace ({@code null} bei cluster-weiten Ressourcen). */
 		private final Map<String, String> namespaces = new HashMap<>();
 		private final List<K8sEdge> edges = new ArrayList<>();
+		private final List<ImportResult.Failure> failures = new ArrayList<>();
+
+		void fail(Class<?> type, String namespace, RuntimeException e) {
+			var collection = operations.collection(type).name();
+			var message = describe(e);
+			log.debug("Import von {} (Namespace {}) fehlgeschlagen", collection, namespace, e);
+			failures.add(new ImportResult.Failure(collection, namespace, message));
+		}
+
+		/** Collections, die gar nicht gelesen werden konnten. */
+		private Set<String> failedCollections() {
+			return failures.stream().filter(f -> f.namespace() == null).map(ImportResult.Failure::collection)
+					.collect(Collectors.toSet());
+		}
+
+		/** Namespaces einer Collection, die nicht gelesen werden konnten. */
+		private List<String> failedNamespaces(String collection) {
+			return failures.stream().filter(f -> f.collection().equals(collection) && f.namespace() != null)
+					.map(ImportResult.Failure::namespace).distinct().toList();
+		}
+
+		/** {@code <collection>/<namespace>} aller nicht lesbaren Namespaces. */
+		private List<String> failedScopes() {
+			return failures.stream().filter(f -> f.namespace() != null)
+					.map(f -> f.collection() + "/" + f.namespace()).distinct().toList();
+		}
 
 		void add(K8sResource resource, ObjectMeta meta) {
 			if (meta != null) {
@@ -569,8 +855,11 @@ public class ClusterGraphImporter {
 				helmEdge(resource, meta);
 			}
 			documents.computeIfAbsent(resource.getClass(), k -> new ArrayList<>()).add(resource);
-			namespaces.put(operations.collection(resource.getClass()).name() + "/" + resource.getKey(),
-					resource.getNamespace());
+			var resourceId = operations.collection(resource.getClass()).name() + "/" + resource.getKey();
+			namespaces.put(resourceId, resource.getNamespace());
+			if (resource.getNamespace() != null) {
+				edges.add(new Contains("namespaces/" + resource.getNamespace(), resourceId));
+			}
 		}
 
 		void edge(K8sEdge edge) {
@@ -621,26 +910,48 @@ public class ClusterGraphImporter {
 					continue;
 				}
 				edge.setKey(edgeKey(edge));
-				edge.setNamespace(namespaces.get(edge.getFrom()));
+				// Start cluster-weit (z. B. contains: Namespace → Pod): Namespace des Ziels, damit die Kante beim Aufräumen
+				// im Scope ihres Ziels bleibt.
+				var fromNamespace = namespaces.get(edge.getFrom());
+				edge.setNamespace(fromNamespace != null ? fromNamespace : namespaces.get(edge.getTo()));
 				resolved.computeIfAbsent(edge.getClass(), k -> new LinkedHashMap<>()).putIfAbsent(edge.getKey(), edge);
 			}
 			if (dropped > 0) {
 				log.debug("{} Kanten ohne importiertes Ziel verworfen", dropped);
 			}
 
+			var failedCollections = failedCollections();
 			for (var type : VERTEX_TYPES) {
 				var extra = type == HelmRelease.class ? MERGE_HELM_HISTORY : "";
-				sync(type, documents.getOrDefault(type, List.of()), extra, now, changes);
+				var collection = operations.collection(type).name();
+				sync(collection, documents.getOrDefault(type, List.of()), extra, now, changes,
+						() -> failedCollections.contains(collection) ? 0 : remove(REMOVE_STALE_VERTICES, collection,
+								now, Map.of("failedNamespaces", failedNamespaces(collection))));
 			}
 			for (var type : EDGE_TYPES) {
-				sync(type, resolved.getOrDefault(type, Map.of()).values(), "", now, changes);
+				var collection = operations.collection(type).name();
+				sync(collection, resolved.getOrDefault(type, Map.of()).values(), "", now, changes,
+						() -> remove(REMOVE_STALE_EDGES, collection, now,
+								Map.of("failedCollections", failedCollections, "failedScopes", failedScopes())));
 			}
-			return new ImportResult(now, changes);
+			return new ImportResult(now, changes, List.copyOf(failures));
 		}
 
-		private void sync(Class<?> type, Collection<?> docs, String extraMerge, String now,
-				Map<String, ImportResult.Changes> changes) {
-			var collection = operations.collection(type).name();
+		private int remove(String query, String collection, String now, Map<String, Object> extraParams) {
+			var params = new HashMap<String, Object>(extraParams);
+			params.put("now", now);
+			params.put("@collection", collection);
+			params.put("allNamespaces", properties.namespaces().isEmpty());
+			params.put("namespaces", properties.namespaces());
+			return operations.query(query, params, Integer.class).asListRemaining().size();
+		}
+
+		/**
+		 * Upsert, danach {@code removeStale}: Erst nach dem Upsert trägt alles, was der Lauf gesehen hat,
+		 * {@code lastSeen == now}.
+		 */
+		private void sync(String collection, Collection<?> docs, String extraMerge, String now,
+				Map<String, ImportResult.Changes> changes, IntSupplier removeStale) {
 			var json = docs.stream().map(operations.getConverter()::write).toList();
 
 			int inserted = 0;
@@ -656,10 +967,7 @@ public class ClusterGraphImporter {
 					}
 				}
 			}
-			int removed = operations.query(REMOVE_STALE,
-					Map.of("now", now, "@collection", collection, "allNamespaces", properties.namespaces().isEmpty(),
-							"namespaces", properties.namespaces()),
-					Integer.class).asListRemaining().size();
+			int removed = removeStale.getAsInt();
 			changes.put(collection, new ImportResult.Changes(inserted, updated, removed));
 		}
 	}
