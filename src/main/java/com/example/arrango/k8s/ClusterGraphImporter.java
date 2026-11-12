@@ -74,6 +74,9 @@ public class ClusterGraphImporter {
 
 	private static final Logger log = LoggerFactory.getLogger(ClusterGraphImporter.class);
 
+	/** Named Graph über alle Collections; wird in {@code PodRepository#path} per Name referenziert. */
+	public static final String GRAPH = "k8s";
+
 	private static final String HELM_SECRET_TYPE = "helm.sh/release.v1";
 
 	private static final List<Class<? extends K8sResource>> VERTEX_TYPES = List.of(
@@ -447,7 +450,7 @@ public class ClusterGraphImporter {
 				.forEach(type -> operations.collection(type).truncate());
 
 		ArangoDatabase db = operations.driver().db(arangoProperties.database());
-		if (!db.graph(properties.graphName()).exists()) {
+		if (!db.graph(GRAPH).exists()) {
 			var vertexCollections = VERTEX_TYPES.stream().map(t -> operations.collection(t).name()).toArray(String[]::new);
 			var edgeDefinitions = EDGE_TYPES.stream()
 					.map(t -> new EdgeDefinition()
@@ -455,7 +458,7 @@ public class ClusterGraphImporter {
 							.from(vertexCollections)
 							.to(vertexCollections))
 					.toList();
-			db.createGraph(properties.graphName(), edgeDefinitions);
+			db.createGraph(GRAPH, edgeDefinitions);
 		}
 	}
 
@@ -530,6 +533,11 @@ public class ClusterGraphImporter {
 		private void helmEdge(K8sResource resource, ObjectMeta meta) {
 			var annotations = meta.getAnnotations();
 			if (annotations == null || !annotations.containsKey("meta.helm.sh/release-name")) {
+				return;
+			}
+			// Controller kopieren die Annotationen weiter (Deployment → ReplicaSet); verwaltet wird nur der Owner.
+			if (meta.getOwnerReferences() != null
+					&& meta.getOwnerReferences().stream().anyMatch(o -> Boolean.TRUE.equals(o.getController()))) {
 				return;
 			}
 			var releaseKey = K8sResource.keyOf(annotations.get("meta.helm.sh/release-namespace"),

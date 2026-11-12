@@ -9,12 +9,10 @@ import java.util.List;
  * Steuerung des Kubernetes-Imports.
  *
  * @param onStartup  beim Start einmal den Cluster importieren
- * @param namespaces nur diese Namespaces importieren; leer = alle
- * @param graphName  Name des ArangoDB-Named-Graphs über alle Vertex- und Edge-Collections
+ * @param namespaces nur diese Namespaces importieren; leer = alle (Nodes und PVs sind immer dabei)
  */
 @ConfigurationProperties(prefix = "k8s.import")
 public record K8sImportProperties(
 		@DefaultValue("false") boolean onStartup,
-		@DefaultValue List<String> namespaces,
-		@DefaultValue("k8s") String graphName) {
+		@DefaultValue List<String> namespaces) {
 }
