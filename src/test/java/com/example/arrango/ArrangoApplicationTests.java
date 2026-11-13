@@ -10,10 +10,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Die App muss ohne ArangoDB und ohne Cluster starten (z. B. in der CI): Port 1 ist garantiert nicht erreichbar,
- * der Import beim Start ist aus. Die Repositories entstehen lazy (siehe {@code ArangoConfig}), erst ein Zugriff
- * scheitert.
+ * Import und Migrationen beim Start sind aus. Die Repositories entstehen lazy (siehe {@code ArangoConfig}), erst
+ * ein Zugriff scheitert.
  */
-@SpringBootTest(properties = { "k8s.import.on-startup=false", "arangodb.host=127.0.0.1", "arangodb.port=1" })
+@SpringBootTest(properties = { "k8s.import.on-startup=false", "arangodb.migrations.on-startup=false",
+		"arangodb.host=127.0.0.1", "arangodb.port=1" })
 class ArrangoApplicationTests {
 
 	@Autowired

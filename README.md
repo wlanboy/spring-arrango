@@ -15,6 +15,17 @@ Minimal Spring Boot service that connects to ArangoDB via Spring Data ArangoDB. 
 
 Health: `GET /actuator/health`
 
+## Migrations
+On startup, before the Kubernetes import, the app runs every `Migration` bean whose version is not yet recorded in the `migrations` collection, in ascending version order. Each successful migration is stored there with `_key` = version, description, `appliedAt` and `durationMs`. A failing migration stops the app from starting and runs again on the next start, so migrations should be idempotent.
+
+To add one, create a `@Component` that implements `com.example.arrango.migration.Migration` with a new version number. Example: `V1ConnectionNameIndex` adds a persistent index on `connections.name`.
+
+| Variable | Default | |
+|---|---|---|
+| `ARANGODB_MIGRATIONS_ON_STARTUP` | `true` | run pending migrations on startup |
+
+This covers a single instance. If several pods start at the same time, a migration can run twice; the second pod then fails on the duplicate `_key` and restarts.
+
 
 ## Kubernetes graph example
 The app can read a Kubernetes cluster (current kubeconfig context, or the ServiceAccount when running in a pod) and store it as a graph in ArangoDB.
