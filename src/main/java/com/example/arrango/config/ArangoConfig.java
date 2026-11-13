@@ -4,6 +4,8 @@ import com.arangodb.ArangoDB;
 import com.arangodb.springframework.annotation.EnableArangoRepositories;
 import com.arangodb.springframework.config.ArangoConfiguration;
 import com.arangodb.springframework.repository.ArangoRepositoryFactoryBean;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -14,6 +16,8 @@ import org.springframework.context.annotation.Configuration;
 @EnableArangoRepositories(basePackages = "com.example.arrango.repository")
 public class ArangoConfig implements ArangoConfiguration {
 
+	private static final Logger log = LoggerFactory.getLogger(ArangoConfig.class);
+
 	private final ArangoProperties properties;
 
 	public ArangoConfig(ArangoProperties properties) {
@@ -22,6 +26,8 @@ public class ArangoConfig implements ArangoConfiguration {
 
 	@Override
 	public ArangoDB.Builder arango() {
+		log.info("ArangoDB {}:{} als Benutzer {}, Datenbank {}", properties.host(), properties.port(),
+				properties.user(), properties.database());
 		return new ArangoDB.Builder()
 				.host(properties.host(), properties.port())
 				.user(properties.user())

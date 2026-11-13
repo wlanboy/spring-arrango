@@ -199,10 +199,7 @@ public class ClusterGraphImporter {
 
 	private void runStartupImport() {
 		try {
-			var result = importCluster();
-			log.info("Import aus Kubernetes-Kontext '{}': {}", contextName(), result.collections());
-			result.failures().forEach(f -> log.warn("Nicht importiert: {}{}: {}", f.collection(),
-					f.namespace() == null ? "" : " in " + f.namespace(), f.error()));
+			importCluster();
 		}
 		catch (RuntimeException e) {
 			log.error("Import beim Start fehlgeschlagen, der Graph bleibt auf dem alten Stand", e);
@@ -215,6 +212,23 @@ public class ClusterGraphImporter {
 	}
 
 	public synchronized ImportResult importCluster() {
+		log.info("Import aus Kubernetes-Kontext '{}' gestartet", contextName());
+		long start = System.nanoTime();
+		var result = doImport();
+		var changed = result.collections().entrySet().stream()
+				.filter(e -> e.getValue().inserted() + e.getValue().updated() + e.getValue().removed() > 0)
+				.map(e -> e.getKey() + "=+" + e.getValue().inserted() + "/~" + e.getValue().updated() + "/-"
+						+ e.getValue().removed())
+				.collect(Collectors.joining(", "));
+		log.info("Import aus Kubernetes-Kontext '{}' nach {} ms beendet, {} Fehler. Geändert: {}", contextName(),
+				(System.nanoTime() - start) / 1_000_000, result.failures().size(),
+				changed.isEmpty() ? "nichts" : changed);
+		result.failures().forEach(f -> log.warn("Nicht importiert: {}{}: {}", f.collection(),
+				f.namespace() == null ? "" : " in " + f.namespace(), f.error()));
+		return result;
+	}
+
+	private ImportResult doImport() {
 		prepareCollections();
 		var snapshot = new Snapshot();
 

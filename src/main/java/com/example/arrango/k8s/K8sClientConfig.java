@@ -2,6 +2,8 @@ package com.example.arrango.k8s;
 
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -15,8 +17,15 @@ import org.springframework.context.annotation.Configuration;
 @EnableConfigurationProperties(K8sImportProperties.class)
 public class K8sClientConfig {
 
+	private static final Logger log = LoggerFactory.getLogger(K8sClientConfig.class);
+
 	@Bean(destroyMethod = "close")
 	KubernetesClient kubernetesClient() {
-		return new KubernetesClientBuilder().build();
+		var client = new KubernetesClientBuilder().build();
+		var config = client.getConfiguration();
+		var context = config.getCurrentContext();
+		log.info("Kubernetes-API {} (Kontext {})", config.getMasterUrl(),
+				context != null ? context.getName() : "keiner, z. B. ServiceAccount im Pod");
+		return client;
 	}
 }
